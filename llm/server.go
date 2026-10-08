@@ -237,7 +237,7 @@ type ChatResponse struct {
 	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
 	PromptEvalDuration    time.Duration `json:"prompt_eval_duration"`
 	DraftN                int           `json:"draft_n"`
-	DraftAcceptedN        int           `json:"draft_accepted_n"`
+	DraftAcceptedN        int           `json:"draft_n_accepted"`
 	EvalCount             int           `json:"eval_count"`
 	EvalDuration          time.Duration `json:"eval_duration"`
 	Logprobs              []Logprob     `json:"logprobs,omitempty"`
@@ -283,7 +283,7 @@ type CompletionResponse struct {
 	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
 	PromptEvalDuration    time.Duration `json:"prompt_eval_duration"`
 	DraftN                int           `json:"draft_n"`
-	DraftAcceptedN        int           `json:"draft_accepted_n"`
+	DraftAcceptedN        int           `json:"draft_n_accepted"`
 	EvalCount             int           `json:"eval_count"`
 	EvalDuration          time.Duration `json:"eval_duration"`
 
