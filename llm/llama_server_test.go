@@ -254,18 +254,18 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 }
 
 // TestLlamaServerCompletionSSEParsingWithDrafts verifies that speculative decoding
-// statistics (draft_n and draft_accepted_n) are parsed from llama-server's SSE
+// statistics (draft_n and draft_n_accepted) are parsed from llama-server's SSE
 // response and passed through to the Go caller's CompletionResponse.
 func TestLlamaServerCompletionSSEParsingWithDrafts(t *testing.T) {
 	// Simulate llama-server SSE streaming response with draft statistics
 	sseLines := []string{
-		`data: {"content":"Draft token 1","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":1,"predicted_ms":9.1,"draft_n":5,"draft_accepted_n":3}}`,
+		`data: {"content":"Draft token 1","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":1,"predicted_ms":9.1,"draft_n":5,"draft_n_accepted":3}}`,
 		``,
 		`:`,
-		`data: {"content":"Draft token 2","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_accepted_n":3}}`,
+		`data: {"content":"Draft token 2","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_n_accepted":3}}`,
 		``,
 		`:`,
-		`data: {"content":"","stop":true,"stop_type":"eos","timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_accepted_n":3}}`,
+		`data: {"content":"","stop":true,"stop_type":"eos","timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_n_accepted":3}}`,
 		``,
 	}
 
@@ -286,7 +286,7 @@ func TestLlamaServerCompletionSSEParsingWithDrafts(t *testing.T) {
 			return
 		}
 		if reqBody.Prompt != "test prompt" {
-				t.Errorf("prompt = %q, want %q", reqBody.Prompt, "test prompt")
+			t.Errorf("prompt = %q, want %q", reqBody.Prompt, "test prompt")
 		}
 		if !reqBody.Stream {
 			t.Error("stream should be true")
@@ -380,7 +380,6 @@ func TestLlamaServerCompletionSSEParsingWithDrafts(t *testing.T) {
 		t.Errorf("response[2].DraftAcceptedN = %d, want 3", responses[2].DraftAcceptedN)
 	}
 }
-
 
 func TestLlamaServerCompletionPromptEvalCountIncludesCache(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
