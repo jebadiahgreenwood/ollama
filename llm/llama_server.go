@@ -1627,11 +1627,13 @@ type llamaServerChatResponse struct {
 }
 
 type llamaServerTimings struct {
-	CacheN    *int    `json:"cache_n"`
-	PromptN   int     `json:"prompt_n"`
-	PromptMS  float64 `json:"prompt_ms"`
-	PredictN  int     `json:"predicted_n"`
-	PredictMS float64 `json:"predicted_ms"`
+	CacheN            *int    `json:"cache_n"`
+	PromptN           int     `json:"prompt_n"`
+	PromptMS          float64 `json:"prompt_ms"`
+	PredictN          int     `json:"predicted_n"`
+	PredictMS         float64 `json:"predicted_ms"`
+	DraftN            int     `json:"draft_n"`
+	DraftAcceptedN    int     `json:"draft_accepted_n"`
 }
 
 func (t llamaServerTimings) promptEvalCount() int {
@@ -1844,8 +1846,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 
 			if lsResp.Content != "" && !lsResp.Stop {
 				fn(CompletionResponse{
-					Content:  lsResp.Content,
-					Logprobs: convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
+					Content:          lsResp.Content,
+					Logprobs:         convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
+					DraftN:           lsResp.Timings.DraftN,
+					DraftAcceptedN:   lsResp.Timings.DraftAcceptedN,
 				})
 			}
 
@@ -1856,14 +1860,16 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				}
 
 				finalResp = CompletionResponse{
-					Content:               lsResp.Content,
-					Done:                  true,
-					DoneReason:            doneReason,
-					PromptEvalCount:       lsResp.Timings.promptEvalCount(),
+					Content:          lsResp.Content,
+					Done:             true,
+					DoneReason:       doneReason,
+					PromptEvalCount:  lsResp.Timings.promptEvalCount(),
 					PromptEvalCachedCount: lsResp.Timings.CacheN,
 					PromptEvalDuration:    time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond)),
-					EvalCount:             lsResp.Timings.PredictN,
-					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
+					EvalCount:            lsResp.Timings.PredictN,
+					EvalDuration:         time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
+					DraftN:               lsResp.Timings.DraftN,
+					DraftAcceptedN:       lsResp.Timings.DraftAcceptedN,
 				}
 				hasFinalResp = true
 			}
