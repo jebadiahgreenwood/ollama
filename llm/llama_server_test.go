@@ -253,6 +253,135 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 	}
 }
 
+// TestLlamaServerCompletionSSEParsingWithDrafts verifies that speculative decoding
+// statistics (draft_n and draft_accepted_n) are parsed from llama-server's SSE
+// response and passed through to the Go caller's CompletionResponse.
+func TestLlamaServerCompletionSSEParsingWithDrafts(t *testing.T) {
+	// Simulate llama-server SSE streaming response with draft statistics
+	sseLines := []string{
+		`data: {"content":"Draft token 1","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":1,"predicted_ms":9.1,"draft_n":5,"draft_accepted_n":3}}`,
+		``,
+		`:`,
+		`data: {"content":"Draft token 2","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_accepted_n":3}}`,
+		``,
+		`:`,
+		`data: {"content":"","stop":true,"stop_type":"eos","timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3,"draft_n":5,"draft_accepted_n":3}}`,
+		``,
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			fmt.Fprint(w, `{"status":"ok"}`)
+			return
+		}
+		if r.URL.Path != "/completion" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			return
+		}
+
+		// Verify request body is valid
+		var reqBody llamaServerCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Errorf("invalid request body: %v", err)
+			return
+		}
+		if reqBody.Prompt != "test prompt" {
+				t.Errorf("prompt = %q, want %q", reqBody.Prompt, "test prompt")
+		}
+		if !reqBody.Stream {
+			t.Error("stream should be true")
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, line := range sseLines {
+			fmt.Fprintln(w, line)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []CompletionResponse
+	opts := api.DefaultOptions()
+	err := runner.Completion(t.Context(), CompletionRequest{
+		Prompt:  "test prompt",
+		Options: &opts,
+	}, func(cr CompletionResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Completion error: %v", err)
+	}
+
+	if len(responses) != 3 {
+		t.Fatalf("got %d responses, want 3", len(responses))
+	}
+
+	// First token - should have draft stats
+	if responses[0].Content != "Draft token 1" {
+		t.Errorf("response[0].Content = %q, want %q", responses[0].Content, "Draft token 1")
+	}
+	if responses[0].Done {
+		t.Error("response[0] should not be done")
+	}
+	// DraftN should be 5 (total tokens proposed by draft model)
+	if responses[0].DraftN != 5 {
+		t.Errorf("response[0].DraftN = %d, want 5", responses[0].DraftN)
+	}
+	// DraftAcceptedN should be 3 (tokens accepted from draft)
+	if responses[0].DraftAcceptedN != 3 {
+		t.Errorf("response[0].DraftAcceptedN = %d, want 3", responses[0].DraftAcceptedN)
+	}
+
+	// Second token - should have draft stats
+	if responses[1].Content != "Draft token 2" {
+		t.Errorf("response[1].Content = %q, want %q", responses[1].Content, "Draft token 2")
+	}
+	if responses[1].Done {
+		t.Error("response[1] should not be done")
+	}
+	if responses[1].DraftN != 5 {
+		t.Errorf("response[1].DraftN = %d, want 5", responses[1].DraftN)
+	}
+	if responses[1].DraftAcceptedN != 3 {
+		t.Errorf("response[1].DraftAcceptedN = %d, want 3", responses[1].DraftAcceptedN)
+	}
+
+	// Final response - should have draft stats
+	if !responses[2].Done {
+		t.Error("response[2] should be done")
+	}
+	if responses[2].DoneReason != DoneReasonStop {
+		t.Errorf("DoneReason = %v, want %v", responses[2].DoneReason, DoneReasonStop)
+	}
+	if responses[2].PromptEvalCount != 5 {
+		t.Errorf("PromptEvalCount = %d, want 5", responses[2].PromptEvalCount)
+	}
+	if got := responses[2].PromptEvalCachedCount; got == nil || *got != 2 {
+		t.Errorf("PromptEvalCachedCount = %v, want 2", got)
+	}
+	if responses[2].EvalCount != 2 {
+		t.Errorf("EvalCount = %d, want 2", responses[2].EvalCount)
+	}
+	// Final response should have draft stats
+	if responses[2].DraftN != 5 {
+		t.Errorf("response[2].DraftN = %d, want 5", responses[2].DraftN)
+	}
+	if responses[2].DraftAcceptedN != 3 {
+		t.Errorf("response[2].DraftAcceptedN = %d, want 3", responses[2].DraftAcceptedN)
+	}
+}
+
+
 func TestLlamaServerCompletionPromptEvalCountIncludesCache(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
