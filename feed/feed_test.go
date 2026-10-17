@@ -167,3 +167,16 @@ func TestErrorsLandInClose(t *testing.T) {
 		t.Fatalf("close must carry done_reason (null when no final piece): %v", c)
 	}
 }
+
+func TestProgramStampReadsVersionSetAfterInit(t *testing.T) {
+	dir := t.TempDir()
+	f := New(dir)
+	Version = "0.35.0-embergate.test"
+	tr := f.Open("h", nil)
+	tr.Close()
+	evs := waitFor(t, dir, 2)
+	prog, _ := evs[0]["program"].(map[string]any)
+	if prog["version"] != "0.35.0-embergate.test" {
+		t.Fatalf("program stamp must see the version set after package init: %v", prog)
+	}
+}
