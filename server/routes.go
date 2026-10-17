@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -36,6 +37,7 @@ import (
 	"github.com/ollama/ollama/decision"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/feed"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/gguf"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
@@ -2285,6 +2287,7 @@ func streamResponse(c *gin.Context, ch chan any) {
 
 		// Delineate chunks with new-line delimiter
 		bts = append(bts, '\n')
+		feed.OutFrom(c, bts) // EmberGate fork feed: the line exactly as sent
 		if _, err := w.Write(bts); err != nil {
 			slog.Info(fmt.Sprintf("streamResponse: w.Write failed with %s", err))
 			return false
@@ -2593,6 +2596,9 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 			resp.Message.ToolCalls = toolCalls
 		}
 
+		if b, err := json.Marshal(resp); err == nil {
+			feed.OutFrom(c, b) // EmberGate fork feed: the body exactly as gin renders it
+		}
 		c.JSON(http.StatusOK, resp)
 		return
 	}
@@ -2921,6 +2927,31 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		toolParser = tools.NewParser(m.Template.Template, req.Tools)
 	}
 
+	// EmberGate fork feed (hearth W-051, 2026-10-17): this process's own record of the turn — the
+	// prompt exactly as rendered for the tokenizer, every runner piece, every line sent back.
+	// Harbor names the turn in X-Harbor-Turn so its feed and this one join by id.
+	fturn := feed.Default.Open(c.GetHeader("X-Harbor-Turn"), map[string]any{
+		"model": req.Model, "model_name": m.ShortName, "model_digest": m.Digest,
+		"model_blob": filepath.Base(m.ModelPath), "parser": m.Config.Parser, "renderer": m.Config.Renderer,
+		"go_template": m.HasGoTemplate, "prefer_chat_template": m.PreferChatTemplate,
+		"rendered_prompt": prompt, "prompt_bytes": len(prompt), "media": len(media),
+		"messages": len(msgs), "tools": len(req.Tools), "truncate": truncate,
+		"stream": req.Stream == nil || *req.Stream, "think": feedThink(req.Think),
+		"think_tags": []string{openingTag, closingTag}, "options": opts,
+		"env": map[string]string{
+			"LLAMA_ARG_SPEC_TYPE":        os.Getenv("LLAMA_ARG_SPEC_TYPE"),
+			"LLAMA_ARG_SPEC_DRAFT_N_MAX": os.Getenv("LLAMA_ARG_SPEC_DRAFT_N_MAX"),
+			"OLLAMA_GO_TEMPLATE":         os.Getenv("OLLAMA_GO_TEMPLATE"),
+		},
+	})
+	if fturn != nil {
+		c.Set(feed.ContextKey, fturn)
+		c.Header("X-Embergate-Feed-Turn", fturn.ID)
+		if fturn.Harbor != "" {
+			c.Header("X-Harbor-Turn", fturn.Harbor)
+		}
+	}
+
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
@@ -2944,6 +2975,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			LeadingBOS:      leadingBOSForModel(m),
 			ThinkingClose:   thinkingCloseForCompletion(builtinParser, thinkTagParser),
 		}, func(r llm.CompletionResponse) {
+			fturn.Piece(feed.Piece{Content: r.Content, Done: r.Done, DoneReason: r.DoneReason.String(),
+				EvalCount: r.EvalCount, PromptEvalCount: r.PromptEvalCount, PromptEvalCachedCount: r.PromptEvalCachedCount,
+				DraftN: r.DraftN, DraftAcceptedN: r.DraftAcceptedN})
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -3032,6 +3066,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			ch <- res
 		})
+		fturn.Finish(err, parserErr)
 		if parserErr != nil {
 			ch <- gin.H{"error": parserErr.Error()}
 			return
@@ -3048,6 +3083,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}()
 
 	writeChatResponse(c, req, ch)
+	fturn.Close()
 }
 
 func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate bool) (llm.ChatRequest, error) {
@@ -3257,3 +3293,14 @@ func filterThinkTags(msgs []api.Message, m *Model) []api.Message {
 	}
 	return msgs
 }
+
+// feedThink renders the request's think value for the EmberGate fork feed (nil when unset).
+func feedThink(t *api.ThinkValue) any {
+	if t == nil {
+		return nil
+	}
+	return t.String()
+}
+
+// The fork feed stamps every open event with the server version (W-051).
+var _ = func() int { feed.Version = version.Version; return 0 }()
