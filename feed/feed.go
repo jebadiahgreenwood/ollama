@@ -51,8 +51,9 @@ type Feed struct {
 	dir     string
 	ch      chan []byte
 	dropped atomic.Int64
-	program map[string]any
-	once    sync.Once
+	program   map[string]any
+	once      sync.Once
+	stampOnce sync.Once
 }
 
 // Default is the process-wide feed (nil-safe: a disabled feed is a nil *Feed).
@@ -69,7 +70,7 @@ func FromEnv() *Feed {
 
 // New makes a feed writing under dir. The writer goroutine starts on first use.
 func New(dir string) *Feed {
-	return &Feed{dir: dir, ch: make(chan []byte, queueSize), program: programStamp()}
+	return &Feed{dir: dir, ch: make(chan []byte, queueSize)}
 }
 
 // Enabled reports whether events are recorded.
@@ -98,8 +99,8 @@ func programStamp() map[string]any {
 	return p
 }
 
-// Version is set by the caller (main) from the ollama version package; feed cannot import
-// it without a cycle risk, so routes.go assigns it once at startup.
+// Version is set by the server package from ollama's version package (routes.go) — after this
+// package's init, which is why the program stamp is computed lazily on first Open.
 var Version = "unknown"
 
 func newID() string {
@@ -212,6 +213,7 @@ func (f *Feed) Open(harborTurn string, fields map[string]any) *Turn {
 		return nil
 	}
 	t := &Turn{f: f, ID: newID(), Harbor: harborTurn, start: time.Now()}
+	f.stampOnce.Do(func() { f.program = programStamp() })
 	ev := map[string]any{"ev": "open", "turn": harborTurn, "feed_turn": t.ID, "program": f.program}
 	for k, v := range fields {
 		ev[k] = v
