@@ -101,8 +101,16 @@ func TestTurnEventsInOrderAndVerbatim(t *testing.T) {
 	}
 	// least processed: no HTML escaping on disk
 	raw, _ := os.ReadFile(filepath.Join(dir, time.Now().UTC().Format("2006-01-02"), "ollama-feed-"+time.Now().UTC().Format("2006-01-02")+".jsonl"))
-	if strings.Contains(string(raw), `<`) {
-		t.Fatal("feed must not HTML-escape the prompt")
+	esc := string([]byte{92}) + "u003c" // the six characters of a JSON \u-escape for '<'
+	if i := strings.Index(string(raw), esc); i >= 0 {
+		lo := i - 160
+		if lo < 0 {
+			lo = 0
+		}
+		t.Fatalf("feed must not HTML-escape the prompt; around: %q", string(raw)[lo:i+40])
+	}
+	if !strings.Contains(string(raw), "<think>") {
+		t.Fatal("the literal '<think>' must be on disk")
 	}
 	if evs[1]["seq"].(float64) != 1 || evs[3]["seq"].(float64) != 3 || evs[1]["draft_n"].(float64) != 3 {
 		t.Fatalf("piece seq/draft wrong: %v %v", evs[1], evs[3])
