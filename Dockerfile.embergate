@@ -1,0 +1,27 @@
+# EmberGate fork image (hearth W-051, 2026-10-17): the Go server rebuilt from this tree on top of the
+# stock ollama image's llama-server + CUDA payloads. Only Go changes live in branch `embergate`
+# (feed/, server/routes.go, llm/ draft counts), so nothing under /usr/lib/ollama needs recompiling.
+#   docker build -f Dockerfile.embergate --build-arg EMBERGATE_VERSION=0.35.0-embergate.<sha> \
+#       -t embergate/ollama-fork:0.35.0-embergate.<sha> .
+# Then services/ollama-kid builds FROM it via --build-arg OLLAMA_BASE=<that tag>.
+ARG OLLAMA_BASE=ollama/ollama:0.35.0
+
+FROM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc g++ git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /go/src/github.com/ollama/ollama
+COPY go.mod go.sum .
+RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-amd64.tar.gz | tar xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
+RUN go mod download
+COPY . .
+ARG EMBERGATE_VERSION=0.35.0-embergate
+ENV CGO_ENABLED=1
+# The feed package proves itself before the server is built.
+RUN go test ./feed/
+RUN go build -trimpath -buildmode=pie \
+    -ldflags="-w -s -X=github.com/ollama/ollama/version.Version=${EMBERGATE_VERSION}" \
+    -o /bin/ollama .
+
+FROM ${OLLAMA_BASE}
+COPY --from=build /bin/ollama /usr/bin/ollama
