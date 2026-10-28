@@ -21,3 +21,8 @@ image and pass its tag as `OLLAMA_BASE`. Current service: `ollama-kid-mtp` (harb
 **Branch `embergate-r5-040`** (2026-10-28, local, not deployed): the same fork commits (draft counts, feed, R5 layer
 schedule) cherry-picked onto upstream **v0.40.12** (`f067033f`, `LLAMA_CPP_VERSION` b11901, which carries llama.cpp's
 chunked GatedDeltaNet CUDA kernel). `llama/compat/002-embergate-layer-schedule.patch` is re-made against b11901.
+
+**Branch `embergate-r5-040-hc`** (2026-10-28, R5/S4c, local, not deployed): `embergate-r5-040` plus
+`llama/compat/003-embergate-residual-streams.patch`, the optional n-branch gated residual for qwen35
+(`<arch>.residual_streams` + `<arch>.residual_rank`, per-layer F32 `blk.N.hc_{mix,mlp}.{gain,w_a,w_u,w_v}`;
+llama.cpp branch `embergate-r5-hc` 18306d36). A GGUF without the key builds the plain graph exactly as before.

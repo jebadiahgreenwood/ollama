@@ -17,6 +17,10 @@
 # embergate-r5-040 (2026-10-28): rebased on upstream v0.40.12 (LLAMA_CPP_VERSION b11901, which has
 # llama.cpp's chunked GatedDeltaNet CUDA kernel, #29353). 002 re-made against b11901. The CPU stage
 # also copies libgomp/libomp into the payload, as upstream 0.40's does.
+#
+# embergate-r5-040-hc (2026-10-28, R5/S4c): adds llama/compat/003-embergate-residual-streams.patch (qwen35
+# <arch>.residual_streams / residual_rank + blk.N.hc_{mix,mlp}.* F32 gates: the 4-branch gated residual,
+# llama.cpp embergate-r5-hc 18306d36). No key = the plain graph, unchanged. Both llama stages grep for it.
 ARG OLLAMA_BASE=ollama/ollama:0.40.12
 ARG CMAKEVERSION=3.31.2
 ARG NINJAVERSION=1.12.1
@@ -59,6 +63,7 @@ COPY llama/compat llama/compat
 COPY cmake cmake
 RUN cmake -S llama/server --preset cpu \
     && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cpu/_deps/llama_cpp-src/src/llama-model.cpp \
+    && grep -q LLM_KV_RESIDUAL_STREAMS build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && cmake --build build/llama-server-cpu -- -l $(nproc) \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && for lib in \
@@ -79,6 +84,7 @@ COPY llama/compat llama/compat
 COPY cmake cmake
 RUN cmake -S llama/server --preset llama_cuda_v13_linux \
     && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cuda_v13/_deps/llama_cpp-src/src/llama-model.cpp \
+    && grep -q LLM_KV_RESIDUAL_STREAMS build/llama-server-cuda_v13/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && cmake --build build/llama-server-cuda_v13 -- -l $(nproc) \
     && cmake --install build/llama-server-cuda_v13 --component llama-server --strip
 

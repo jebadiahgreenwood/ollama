@@ -1,0 +1,368 @@
+From 18306d36760dc0b08fd932323f68bf7e73683264 Mon Sep 17 00:00:00 2001
+From: EmberGate <jebadiahgreenwood@gmail.com>
+Date: Wed, 28 Oct 2026 21:34:25 +0000
+Subject: [PATCH] qwen35 : optional n-branch gated residual
+ (<arch>.residual_streams) (EmberGate R5/S2)
+
+A qwen35 GGUF may carry <arch>.residual_streams = n (> 1) and <arch>.residual_rank = r, plus per FILE trunk
+layer N eight F32 tensors blk.N.hc_mix.{gain,w_a,w_u,w_v} and blk.N.hc_mlp.{gain,w_a,w_u,w_v}. The trunk then
+carries the residual as n branches S [n_embd, n, T] (the embedding fanned out n times). Around each sub-block
+(mixer, MLP):
+  read : Rh = rms_norm(S) * gain, v = Rh as [n*n_embd, T], G = 2*sigmoid(W_u silu(W_a v / n)),
+         x = mean_i (G * Rh)_i (the sub-block input), s = 2*sigmoid(W_v v / n) [n, T]
+  write: S_i += s_i * y (y = the unchanged sub-block output)
+After the last layer h = mean_i S_i goes to output_norm; output_norm(h) is also the MTP head's input
+(t_h_nextn), as in the HF reference (archmods.MergeNorm merges before the final norm). The MTP block itself keeps
+its plain residual. With <arch>.layer_schedule a repeated position uses its file layer's gates (shared, like its
+other weights). Only existing ggml ops (rms_norm, mul, mul_mat, sigmoid, silu, scale, repeat, add, views).
+
+No key: the plain loop is built exactly as before (logit files byte-identical on the plain and the scheduled a50).
+---
+ src/llama-arch.cpp    |  18 +++++
+ src/llama-arch.h      |  10 +++
+ src/llama-hparams.h   |   4 ++
+ src/llama-model.h     |  11 +++
+ src/models/models.h   |  23 ++++++
+ src/models/qwen35.cpp | 162 +++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 227 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index b2349b46..a982fe91 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -238,6 +238,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_POST_NORM_EPS,                     "%s.post_norm_epsilon"                 },
+     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+     { LLM_KV_LAYER_SCHEDULE,                    "%s.layer_schedule"                    },
++    { LLM_KV_RESIDUAL_STREAMS,                  "%s.residual_streams"                  },
++    { LLM_KV_RESIDUAL_RANK,                     "%s.residual_rank"                     },
+     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
+     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
+     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
+@@ -641,6 +643,14 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_HC_FFN_DOWN_INJECT,                     "blk.%d.hc_ffn_down_inject" },
+     { LLM_TENSOR_ATTN_QKV_GATE,                          "blk.%d.attn_qkv_gate" },
+     { LLM_TENSOR_SSM_BETA_ALPHA_CAT,                     "blk.%d.ssm_beta_alpha" },
++    { LLM_TENSOR_HC_MIX_GAIN,                        "blk.%d.hc_mix.gain" },
++    { LLM_TENSOR_HC_MIX_W_A,                         "blk.%d.hc_mix.w_a" },
++    { LLM_TENSOR_HC_MIX_W_U,                         "blk.%d.hc_mix.w_u" },
++    { LLM_TENSOR_HC_MIX_W_V,                         "blk.%d.hc_mix.w_v" },
++    { LLM_TENSOR_HC_MLP_GAIN,                        "blk.%d.hc_mlp.gain" },
++    { LLM_TENSOR_HC_MLP_W_A,                         "blk.%d.hc_mlp.w_a" },
++    { LLM_TENSOR_HC_MLP_W_U,                         "blk.%d.hc_mlp.w_u" },
++    { LLM_TENSOR_HC_MLP_W_V,                         "blk.%d.hc_mlp.w_v" },
+     { LLM_TENSOR_PLE_KEY,                                "blk.%d.ple_key" },
+     { LLM_TENSOR_PLE_VALUE,                              "blk.%d.ple_value" },
+     { LLM_TENSOR_PLE_NORM_KEY,                           "blk.%d.ple_norm_key" },
+@@ -917,6 +927,14 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HC_FFN_DOWN_INJECT,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ATTN_QKV_GATE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_SSM_BETA_ALPHA_CAT,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MIX_GAIN,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_HC_MIX_W_A,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MIX_W_U,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MIX_W_V,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MLP_GAIN,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_HC_MLP_W_A,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MLP_W_U,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MLP_W_V,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_KEY,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_VALUE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_NORM_KEY,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 02db4030..e968b396 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -242,6 +242,8 @@ enum llm_kv {
+     LLM_KV_POST_NORM_EPS,
+     LLM_KV_NEXTN_PREDICT_LAYERS,
+     LLM_KV_LAYER_SCHEDULE,
++    LLM_KV_RESIDUAL_STREAMS, // EmberGate R5/S2: qwen35 n-branch gated residual
++    LLM_KV_RESIDUAL_RANK,
+     LLM_KV_NUM_DEEPSTACK_LAYERS,
+     LLM_KV_DEEPSTACK_MAPPING,
+     LLM_KV_HIDDEN_ACT,
+@@ -684,6 +686,14 @@ enum llm_tensor {
+     LLM_TENSOR_HC_FFN_DOWN_INJECT,  // qwen4exp
+     LLM_TENSOR_ATTN_QKV_GATE,       // qwen4exp
+     LLM_TENSOR_SSM_BETA_ALPHA_CAT,  // qwen4exp
++    LLM_TENSOR_HC_MIX_GAIN,         // EmberGate R5/S2: qwen35 n-branch residual, read before the mixer
++    LLM_TENSOR_HC_MIX_W_A,
++    LLM_TENSOR_HC_MIX_W_U,
++    LLM_TENSOR_HC_MIX_W_V,
++    LLM_TENSOR_HC_MLP_GAIN,         // ... and before the MLP
++    LLM_TENSOR_HC_MLP_W_A,
++    LLM_TENSOR_HC_MLP_W_U,
++    LLM_TENSOR_HC_MLP_W_V,
+     LLM_TENSOR_PLE_KEY,        // qwen4exp
+     LLM_TENSOR_PLE_VALUE,      // qwen4exp
+     LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 0fdc4efc..074666b1 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -77,6 +77,10 @@ struct llama_hparams {
+     // (then n_layer_all = schedule length + n_layer_nextn and every per-layer array is indexed by POSITION).
+     // 0 = no schedule.
+     uint32_t n_layer_file = 0;
++    // EmberGate R5/S2 (qwen35): residual as n gated branches (<arch>.residual_streams, > 1 = on) with low-rank
++    // read gates of rank residual_rank (blk.N.hc_mix.* / blk.N.hc_mlp.*). 0 = the plain single-stream residual.
++    uint32_t n_residual_streams = 0;
++    uint32_t residual_rank      = 0;
+ 
+     // granite-switch: index of the single-head "router" KV layer that encodes
+     // per-token adapter selection. -1 when the model has no such layer.
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 066ed8bd..650182de 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -628,6 +628,17 @@ struct llama_layer {
+     struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
+     struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
+ 
++    // EmberGate R5/S2: qwen35 n-branch gated residual (read gain [n_embd, n], W_a [n*n_embd, r], W_u [r, n*n_embd],
++    // W_v [n*n_embd, n]), one set before the mixer and one before the MLP
++    struct ggml_tensor * hc_mix_gain = nullptr;
++    struct ggml_tensor * hc_mix_w_a  = nullptr;
++    struct ggml_tensor * hc_mix_w_u  = nullptr;
++    struct ggml_tensor * hc_mix_w_v  = nullptr;
++    struct ggml_tensor * hc_mlp_gain = nullptr;
++    struct ggml_tensor * hc_mlp_w_a  = nullptr;
++    struct ggml_tensor * hc_mlp_w_u  = nullptr;
++    struct ggml_tensor * hc_mlp_w_v  = nullptr;
++
+     struct ggml_tensor * ple_key        = nullptr;
+     struct ggml_tensor * ple_value      = nullptr;
+     struct ggml_tensor * ple_norm_key   = nullptr;
+diff --git a/src/models/models.h b/src/models/models.h
+index 37dbacdb..5b0ed3a6 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2609,6 +2609,29 @@ struct llama_model_qwen35 : public llama_model_base {
+                     ggml_tensor * input,
+                             int   il);
+ 
++        // EmberGate R5/S2: n-branch gated residual (<arch>.residual_streams > 1)
++        ggml_tensor * build_hc_trunk(
++                    ggml_tensor * inpL,
++     llm_graph_input_mem_hybrid * inp,
++                    ggml_tensor * inp_pos,
++                    ggml_tensor * inp_out_ids,
++                            int * sections);
++
++        ggml_tensor * build_hc_read(
++                    ggml_tensor *  S,
++                    ggml_tensor *  gain,
++                    ggml_tensor *  w_a,
++                    ggml_tensor *  w_u,
++                    ggml_tensor *  w_v,
++                    ggml_tensor ** s,
++                            int    il);
++
++        ggml_tensor * build_hc_write(
++                    ggml_tensor * S,
++                    ggml_tensor * s,
++                    ggml_tensor * y,
++                            int   il);
++
+         const llama_model & model;
+     };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8a4e4341..be8758f7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -22,6 +22,17 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+         }
+     }
+ 
++    // EmberGate R5/S2: optional n-branch gated residual; absent key = the plain residual, nothing else changes
++    ml.get_key(LLM_KV_RESIDUAL_STREAMS, hparams.n_residual_streams, false);
++    if (hparams.n_residual_streams > 1) {
++        ml.get_key(LLM_KV_RESIDUAL_RANK, hparams.residual_rank);
++        if (hparams.residual_rank == 0) {
++            throw std::runtime_error(format("%s = %u needs %s > 0 (the rank of the blk.N.hc_mix/hc_mlp w_a/w_u gates)",
++                ml.llm_kv(LLM_KV_RESIDUAL_STREAMS).c_str(), hparams.n_residual_streams,
++                ml.llm_kv(LLM_KV_RESIDUAL_RANK).c_str()));
++        }
++    }
++
+     switch (hparams.n_layer()) {
+         case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
+         case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
+@@ -92,6 +103,22 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
+         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
+         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
++
++        // EmberGate R5/S2: the read gates of the n-branch residual, one set per FILE layer (a scheduled repeat
++        // shares its layer's set, like its other weights)
++        if (hparams.n_residual_streams > 1) {
++            const int64_t nb = hparams.n_residual_streams;
++            const int64_t nd = nb * n_embd;
++            const int64_t r  = hparams.residual_rank;
++            layer.hc_mix_gain = create_tensor(tn(LLM_TENSOR_HC_MIX_GAIN, il), { n_embd, nb }, flags);
++            layer.hc_mix_w_a  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_A,  il), { nd, r },      flags);
++            layer.hc_mix_w_u  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_U,  il), { r, nd },      flags);
++            layer.hc_mix_w_v  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_V,  il), { nd, nb },     flags);
++            layer.hc_mlp_gain = create_tensor(tn(LLM_TENSOR_HC_MLP_GAIN, il), { n_embd, nb }, flags);
++            layer.hc_mlp_w_a  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_A,  il), { nd, r },      flags);
++            layer.hc_mlp_w_u  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_U,  il), { r, nd },      flags);
++            layer.hc_mlp_w_v  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_V,  il), { nd, nb },     flags);
++        }
+     };
+ 
+     auto load_block_mtp = [&](int il) {
+@@ -155,8 +182,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // EmberGate R5/S2: with <arch>.residual_streams > 1 the trunk carries n gated branches and returns their mean
++    // (already cropped to the output rows); the plain loop below then runs zero times
++    const bool hc = hparams.n_residual_streams > 1;
++    if (hc) {
++        inpL = build_hc_trunk(inpL, inp, inp_pos, inp_out_ids, sections);
++    }
++
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = 0; il < (hc ? 0 : n_layer); ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -236,6 +270,132 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     res->t_logits = cur;
+ }
+ 
++// EmberGate R5/S2: n-branch gated residual (the "4-branch residual" of research/arch-experiments/archmods.py).
++// The residual S is [n_embd, n, T]; the first layer fans the embedding out n times. Per sub-block (mixer, MLP):
++//   read : Rh = rms_norm(S) * gain;  v = Rh as [n*n_embd, T];  G = 2*sigmoid(W_u silu(W_a v / n))
++//          x  = mean_i (G * Rh)_i  (the sub-block input);     s = 2*sigmoid(W_v v / n)  [n, T]
++//   write: S_i += s_i * y          (y = the unchanged sub-block output)
++// After the last layer h = mean_i S_i goes to output_norm, and output_norm(h) is also the MTP head's input
++// (t_h_nextn), as in HF where archmods.MergeNorm merges before the final norm. Op-for-op reference, equal to
++// archmods.HCDecoderLayer in fp32: research/arch-experiments/r5/hc_reference.py.
++
++// mean over the branch axis; for n = 4 summed pairwise like archmods._branch_mean
++static ggml_tensor * hc_branch_mean(ggml_context * ctx, ggml_tensor * x) {
++    const int64_t nb = x->ne[1];
++    auto br = [&](int64_t i) {
++        return ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], i*x->nb[1]);
++    };
++    ggml_tensor * acc = nullptr;
++    if (nb == 4) {
++        acc = ggml_add(ctx, ggml_add(ctx, br(0), br(1)), ggml_add(ctx, br(2), br(3)));
++    } else {
++        acc = ggml_add(ctx, br(0), br(1));
++        for (int64_t i = 2; i < nb; ++i) {
++            acc = ggml_add(ctx, acc, br(i));
++        }
++    }
++    return ggml_scale(ctx, acc, 1.0f / (float) nb);
++}
++
++ggml_tensor * llama_model_qwen35::graph::build_hc_read(
++        ggml_tensor *  S,
++        ggml_tensor *  gain,
++        ggml_tensor *  w_a,
++        ggml_tensor *  w_u,
++        ggml_tensor *  w_v,
++        ggml_tensor ** s,
++        int            il) {
++    const int64_t nb = S->ne[1];
++    const int64_t nt = S->ne[2];
++
++    ggml_tensor * rh = ggml_mul(ctx0, ggml_rms_norm(ctx0, S, hparams.f_norm_rms_eps), gain);
++    cb(rh, "hc_norm", il);
++
++    ggml_tensor * v = ggml_reshape_2d(ctx0, rh, n_embd*nb, nt);
++
++    ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_a, v), 1.0f / (float) nb));
++    ggml_tensor * g  = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, w_u, lo)), 2.0f);
++    cb(g, "hc_gate", il);
++
++    ggml_tensor * x = hc_branch_mean(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, g, n_embd, nb, nt), rh));
++    cb(x, "hc_read", il);
++
++    *s = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_v, v), 1.0f / (float) nb)), 2.0f);
++    cb(*s, "hc_write_scale", il);
++
++    return x;
++}
++
++ggml_tensor * llama_model_qwen35::graph::build_hc_write(
++        ggml_tensor * S,
++        ggml_tensor * s,
++        ggml_tensor * y,
++        int           il) {
++    const int64_t nb = S->ne[1];
++    const int64_t nt = S->ne[2];
++
++    ggml_tensor * yb  = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, y, n_embd, 1, nt), n_embd, nb, nt, 1);
++    ggml_tensor * out = ggml_add(ctx0, S, ggml_mul(ctx0, yb, ggml_reshape_3d(ctx0, s, 1, nb, nt)));
++    cb(out, "hc_write", il);
++
++    return out;
++}
++
++ggml_tensor * llama_model_qwen35::graph::build_hc_trunk(
++        ggml_tensor *                inpL,
++        llm_graph_input_mem_hybrid * inp,
++        ggml_tensor *                inp_pos,
++        ggml_tensor *                inp_out_ids,
++        int *                        sections) {
++    const int64_t nb = hparams.n_residual_streams;
++
++    ggml_tensor * S = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens), n_embd, nb, n_tokens, 1);
++    cb(S, "hc_init", -1);
++    ggml_build_forward_expand(gf, S);
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & layer = model.layers[il];
++
++        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
++            res->t_layer_inp[il] = hc_branch_mean(ctx0, S);
++            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
++        }
++
++        ggml_tensor * s   = nullptr;
++        ggml_tensor * cur = build_hc_read(S, layer.hc_mix_gain, layer.hc_mix_w_a, layer.hc_mix_w_u, layer.hc_mix_w_v, &s, il);
++        ggml_build_forward_expand(gf, cur);
++
++        if (hparams.is_recr(il)) {
++            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
++        } else {
++            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
++        }
++
++        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++            s   = ggml_get_rows(ctx0, s,   inp_out_ids);
++            S   = ggml_reshape_2d(ctx0, S, n_embd*nb, S->ne[2]);
++            S   = ggml_get_rows(ctx0, S, inp_out_ids);
++            S   = ggml_reshape_3d(ctx0, S, n_embd, nb, S->ne[1]);
++        }
++
++        S = build_hc_write(S, s, cur, il);
++        cb(S, "attn_residual", il);
++
++        cur = build_hc_read(S, layer.hc_mlp_gain, layer.hc_mlp_w_a, layer.hc_mlp_w_u, layer.hc_mlp_w_v, &s, il);
++        cur = build_layer_ffn(cur, il);
++
++        S = build_hc_write(S, s, cur, il);
++        S = build_cvec(S, il);  // a control vector [n_embd] broadcasts over the branches (moves their mean)
++        cb(S, "hc_l_out", il);
++    }
++
++    ggml_tensor * h = hc_branch_mean(ctx0, S);
++    cb(h, "hc_merge", -1);
++
++    return h;
++}
++
+ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
+                 ggml_tensor * input,
+                         int   il) {
+-- 
+2.43.0
+
