@@ -1,10 +1,21 @@
 # EmberGate fork image (hearth W-051, 2026-10-17): the Go server rebuilt from this tree on top of the
-# stock ollama image's llama-server + CUDA payloads. Only Go changes live in branch `embergate`
-# (feed/, server/routes.go, llm/ draft counts), so nothing under /usr/lib/ollama needs recompiling.
+# stock ollama image's llama-server + CUDA payloads.
 #   docker build -f Dockerfile.embergate --build-arg EMBERGATE_VERSION=0.35.0-embergate.<sha> \
 #       -t embergate/ollama-fork:0.35.0-embergate.<sha> .
 # Then services/ollama-kid builds FROM it via --build-arg OLLAMA_BASE=<that tag>.
+#
+# embergate-r5 (R5/S4, 2026-10-28): llama-server is ALSO rebuilt from this tree, because
+# llama/compat/002-embergate-layer-schedule.patch (<arch>.layer_schedule) changes libllama. The two
+# llama-server stages below are upstream's Dockerfile `llama-server-cpu` and `llama-server-cuda_v13`
+# stages (same presets, same CMake flags and arch lists, same gcc-toolset-13 on EL8 as the stock
+# payload, which reports "built with GNU 13.3.1"). One deviation: upstream's amd64 `base` is
+# rocm/dev-almalinux-8 (tens of GB, ROCm unused here); this uses plain almalinux:8 with the same
+# compiler, CMake and Ninja. Only the CPU payload (llama-server, libllama*, libggml*, libggml-cpu-*)
+# and cuda_v13 (the variant the seat loads) are rebuilt; the stock cuda_v12, vulkan and mlx payloads
+# are left as they are (ggml is untouched by our patch, same b11081 source).
 ARG OLLAMA_BASE=ollama/ollama:0.35.0
+ARG CMAKEVERSION=3.31.2
+ARG NINJAVERSION=1.12.1
 
 FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc g++ git \
@@ -23,5 +34,46 @@ RUN go build -trimpath -buildmode=pie \
     -ldflags="-w -s -X=github.com/ollama/ollama/version.Version=${EMBERGATE_VERSION}" \
     -o /bin/ollama .
 
+FROM almalinux:8 AS llama-base
+ARG CMAKEVERSION
+ARG NINJAVERSION
+RUN dnf install -y yum-utils git unzip gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-binutils \
+    && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
+    && dnf clean all
+ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
+RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}/cmake-${CMAKEVERSION}-linux-$(uname -m).tar.gz | tar xz -C /usr/local --strip-components 1
+RUN curl -fsSL -o /tmp/ninja.zip https://github.com/ninja-build/ninja/releases/download/v${NINJAVERSION}/ninja-linux.zip \
+    && unzip /tmp/ninja.zip -d /usr/local/bin \
+    && rm /tmp/ninja.zip
+ENV CMAKE_GENERATOR=Ninja
+ENV LDFLAGS=-s
+
+FROM llama-base AS llama-server-cpu
+COPY LLAMA_CPP_VERSION .
+COPY llama/server llama/server
+COPY llama/compat llama/compat
+COPY cmake cmake
+RUN cmake -S llama/server --preset cpu \
+    && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cpu/_deps/llama_cpp-src/src/llama-model.cpp \
+    && cmake --build build/llama-server-cpu -- -l $(nproc) \
+    && cmake --install build/llama-server-cpu --component llama-server --strip
+
+FROM llama-base AS llama-server-cuda_v13
+ARG CUDA13VERSION=13.0
+RUN dnf install -y cuda-toolkit-${CUDA13VERSION//./-} && dnf clean all
+ENV PATH=/usr/local/cuda-13/bin:$PATH
+COPY LLAMA_CPP_VERSION .
+COPY llama/server llama/server
+COPY llama/compat llama/compat
+COPY cmake cmake
+RUN cmake -S llama/server --preset llama_cuda_v13_linux \
+    && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cuda_v13/_deps/llama_cpp-src/src/llama-model.cpp \
+    && cmake --build build/llama-server-cuda_v13 -- -l $(nproc) \
+    && cmake --install build/llama-server-cuda_v13 --component llama-server --strip
+
 FROM ${OLLAMA_BASE}
+# Drop the stock payloads we replace, so no stale stock file survives beside ours.
+RUN cd /usr/lib/ollama && rm -rf cuda_v13 llama-server llama-quantize libllama*.so* libggml*.so* libmtmd.so*
+COPY --from=llama-server-cpu      dist/lib/ollama /usr/lib/ollama/
+COPY --from=llama-server-cuda_v13 dist/lib/ollama /usr/lib/ollama/
 COPY --from=build /bin/ollama /usr/bin/ollama

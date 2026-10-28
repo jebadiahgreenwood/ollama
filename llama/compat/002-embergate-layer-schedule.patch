@@ -1,0 +1,240 @@
+From 558a0067aec4b879ddd48a9bc33d0b0d5220e50f Mon Sep 17 00:00:00 2001
+From: EmberGate <embergate@localhost>
+Date: Wed, 28 Oct 2026 10:58:00 +0000
+Subject: [PATCH] llama : optional <arch>.layer_schedule for synthetic layer
+ repeats (EmberGate R5/S1)
+
+A GGUF may carry <arch>.layer_schedule, an array of FILE trunk layer indices, one per trunk
+POSITION (e.g. B1 on a 32-layer Qwen3.5 = 0..7, 4..7, 8..31 = 36 positions). The trunk then runs
+those layers in that order with the weights shared (no copies): tensors are created once per file
+layer under their file names, and layers[p] is a copy of the layer struct of sched[p].
+
+Every per-layer hparams array is re-indexed by position (n_layer_all = len + n_layer_nextn), so each
+position is its own layer index for every cache (KV for full attention, conv + recurrent state for
+DeltaNet: a repeated recurrent pass needs its own state slot). MTP/NextN layers keep their file names
+and sit after the trunk. dev_layer is remapped the same way, so a position's cache lives with its
+weights. hparams.n_layer_file keeps the file's trunk count.
+
+Generic (llama_model_base), no per-arch code: hparams are swapped to the file view while
+load_arch_tensors + the generic scale pass create tensors, then expanded to positions before
+done_getting_tensors(). Refused (with the reason) for archs whose layer-index scalars a schedule
+would not remap (n_layer_dense_lead, n_layer_kv_from_start, router_layer).
+
+Absent key: nothing changes (CPU: plain GGUF logits byte-identical to the unpatched build).
+Not handled: llama-model-saver writes the position count as block_count.
+---
+ src/llama-arch.cpp  |   1 +
+ src/llama-arch.h    |   1 +
+ src/llama-hparams.h |   4 ++
+ src/llama-model.cpp | 115 ++++++++++++++++++++++++++++++++++++++++++++
+ src/llama-model.h   |   3 ++
+ 5 files changed, 124 insertions(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 03b7951c..bb088c62 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -221,6 +221,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
+     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
+     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
++    { LLM_KV_LAYER_SCHEDULE,                    "%s.layer_schedule"                    },
+     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
+     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
+     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index af64f4ec..142f94a1 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -226,6 +226,7 @@ enum llm_kv {
+     LLM_KV_MOE_EVERY_N_LAYERS,
+     LLM_KV_MOE_LATENT_SIZE,
+     LLM_KV_NEXTN_PREDICT_LAYERS,
++    LLM_KV_LAYER_SCHEDULE,
+     LLM_KV_NUM_DEEPSTACK_LAYERS,
+     LLM_KV_DEEPSTACK_MAPPING,
+     LLM_KV_HIDDEN_ACT,
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 73dffcc9..1d829456 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -65,6 +65,10 @@ struct llama_hparams {
+     uint32_t n_embd;
+     uint32_t n_layer_all;
+     uint32_t n_layer_nextn = 0;
++    // EmberGate layer schedule: trunk layer count in the FILE when <arch>.layer_schedule is present
++    // (then n_layer_all = schedule length + n_layer_nextn and every per-layer array is indexed by POSITION).
++    // 0 = no schedule.
++    uint32_t n_layer_file = 0;
+ 
+     // granite-switch: index of the single-head "router" KV layer that encodes
+     // per-token adapter selection. -1 when the model has no such layer.
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50d..ddd054d9 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1202,6 +1202,10 @@ struct llama_model::impl {
+     layer_dev dev_output = {};
+     std::vector<layer_dev> dev_layer;
+ 
++    // EmberGate layer schedule (empty = none): position -> file trunk layer
++    std::vector<uint32_t> layer_schedule;
++    llama_hparams         hparams_file; // hparams as the file declares them (valid when layer_schedule is set)
++
+     bool has_tensor_overrides;
+ 
+     std::vector<float> tensor_split_owned;
+@@ -1410,6 +1414,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     // per-arch hparams
+     load_arch_hparams(ml);
+ 
++    apply_layer_schedule(ml);
++
+     pimpl->n_bytes = ml.n_bytes;
+ 
+     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+@@ -1429,11 +1435,104 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+ 
++// EmberGate (R5/S1): optional <arch>.layer_schedule = array of FILE trunk layer indices, one per trunk POSITION.
++// The trunk then runs those layers in that order with weights shared (no copies); each position is its own layer
++// index for every cache (KV, conv + recurrent state), because a repeated recurrent pass needs its own state.
++// MTP/NextN layers stay after the trunk. Absent key: nothing changes.
++void llama_model_base::apply_layer_schedule(llama_model_loader & ml) {
++    std::vector<uint32_t> sched;
++    if (!ml.get_arr(LLM_KV_LAYER_SCHEDULE, sched, false)) {
++        return;
++    }
++    const std::string key = LLM_KV(arch)(LLM_KV_LAYER_SCHEDULE);
++    const uint32_t n_file = hparams.n_layer();
++    const uint32_t n_next = hparams.n_layer_nextn;
++    if (sched.empty()) {
++        throw std::runtime_error(format("%s is present but empty: list the file trunk layer indices to run "
++            "(0..%u), or remove the key", key.c_str(), n_file - 1));
++    }
++    if (sched.size() + n_next > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error(format("%s has %zu positions; with %u MTP layer(s) that exceeds LLAMA_MAX_LAYERS = %d",
++            key.c_str(), sched.size(), n_next, LLAMA_MAX_LAYERS));
++    }
++    for (size_t p = 0; p < sched.size(); ++p) {
++        if (sched[p] >= n_file) {
++            throw std::runtime_error(format("%s[%zu] = %u, but the file has %u trunk layers (0..%u); "
++                "MTP layers (%u..%u) are kept after the trunk automatically and must not be listed",
++                key.c_str(), p, sched[p], n_file, n_file - 1, n_file, hparams.n_layer_all - 1));
++        }
++    }
++    if (hparams.n_layer_dense_lead > 0 || hparams.n_layer_kv_from_start >= 0 || hparams.router_layer >= 0) {
++        throw std::runtime_error(format("%s: arch %s uses layer-index scalars (n_layer_dense_lead = %u, "
++            "n_layer_kv_from_start = %d, router_layer = %d) that a schedule does not remap; remove the key",
++            key.c_str(), arch_name().c_str(), hparams.n_layer_dense_lead, hparams.n_layer_kv_from_start, hparams.router_layer));
++    }
++
++    pimpl->hparams_file   = hparams;
++    pimpl->layer_schedule = sched;
++
++    const uint32_t n_pos = (uint32_t) sched.size();
++    // position -> file layer, MTP appended
++    std::vector<uint32_t> src(n_pos + n_next);
++    for (uint32_t p = 0; p < n_pos;  ++p) { src[p] = sched[p]; }
++    for (uint32_t k = 0; k < n_next; ++k) { src[n_pos + k] = n_file + k; }
++
++    auto remap = [&](auto & arr) {
++        const auto orig = arr;
++        for (size_t p = 0; p < src.size(); ++p) {
++            arr[p] = orig[src[p]];
++        }
++    };
++    remap(hparams.n_head_arr);
++    remap(hparams.n_head_kv_arr);
++    remap(hparams.n_ff_arr);
++    remap(hparams.n_ff_exp_arr);
++    remap(hparams.n_expert_used_arr);
++    remap(hparams.rope_pattern);
++    remap(hparams.is_swa_impl);
++    remap(hparams.is_recr_impl);
++    remap(hparams.xielu_alpha_n);
++    remap(hparams.xielu_alpha_p);
++    remap(hparams.xielu_beta);
++    remap(hparams.xielu_eps);
++    remap(hparams.is_indexer_full_impl);
++    remap(hparams.dsv4_compress_ratios);
++    remap(hparams.deepstack_mapping_arr);
++    remap(hparams.swiglu_clamp_exp);
++    remap(hparams.swiglu_clamp_shexp);
++    {
++        const auto orig = hparams.is_ple_impl;
++        for (size_t p = 0; p < src.size(); ++p) {
++            hparams.is_ple_impl[p] = orig[src[p]];
++        }
++    }
++
++    hparams.n_layer_file = n_file;
++    hparams.n_layer_all  = n_pos + n_next;
++
++    std::string s;
++    for (uint32_t p = 0; p < n_pos; ) {
++        uint32_t q = p;
++        while (q + 1 < n_pos && sched[q + 1] == sched[q] + 1) { ++q; }
++        s += (s.empty() ? "" : ",") + (q == p ? std::to_string(sched[p]) : std::to_string(sched[p]) + "-" + std::to_string(sched[q]));
++        p = q + 1;
++    }
++    LLAMA_LOG_INFO("%s: %s: %u trunk positions over %u file trunk layers [%s], %u MTP layer(s) after\n",
++        __func__, key.c_str(), n_pos, n_file, s.c_str(), n_next);
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+     const auto & tensor_split = params.tensor_split;
+ 
++    // layer schedule: tensors are created once per FILE layer (file names, file indices), so switch to the
++    // file's hparams here and expand to positions right before done_getting_tensors()
++    const bool has_schedule = !pimpl->layer_schedule.empty();
++    if (has_schedule) {
++        std::swap(hparams, pimpl->hparams_file);
++    }
++
+     const int n_layer_all = hparams.n_layer_all;
+     const int n_gpu_layers = this->n_gpu_layers();
+ 
+@@ -1716,6 +1815,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
++    if (has_schedule) {
++        std::swap(hparams, pimpl->hparams_file); // back to positions
++        const uint32_t n_file = pimpl->hparams_file.n_layer();
++        const uint32_t n_pos  = hparams.n_layer();
++        const uint32_t n_next = hparams.n_layer_nextn;
++        std::vector<llama_layer>               layers_pos(n_pos + n_next);
++        std::vector<llama_model::impl::layer_dev> dev_pos(n_pos + n_next);
++        for (uint32_t p = 0; p < n_pos + n_next; ++p) {
++            const uint32_t f = p < n_pos ? pimpl->layer_schedule[p] : n_file + (p - n_pos);
++            layers_pos[p] = layers.at(f);         // same ggml tensors: weights shared
++            dev_pos[p]    = pimpl->dev_layer.at(f); // caches live with their layer's weights
++        }
++        layers           = std::move(layers_pos);
++        pimpl->dev_layer = std::move(dev_pos);
++    }
++
+     ml.done_getting_tensors();
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 984b2cf3..d3b6c8e2 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -783,6 +783,9 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
+ 
+ // model must inherit from this
+ struct llama_model_base : public llama_model {
++    // EmberGate: <arch>.layer_schedule (see llama-model.cpp)
++    void apply_layer_schedule(llama_model_loader & ml);
++
+     friend struct llama_model;
+ 
+     llama_model * model;
+-- 
+2.43.0
+
