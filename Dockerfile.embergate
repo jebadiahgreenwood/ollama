@@ -1,19 +1,23 @@
 # EmberGate fork image (hearth W-051, 2026-10-17): the Go server rebuilt from this tree on top of the
 # stock ollama image's llama-server + CUDA payloads.
-#   docker build -f Dockerfile.embergate --build-arg EMBERGATE_VERSION=0.35.0-embergate.<sha> \
-#       -t embergate/ollama-fork:0.35.0-embergate.<sha> .
+#   docker build -f Dockerfile.embergate --build-arg EMBERGATE_VERSION=0.40.12-embergate.<sha> \
+#       -t embergate/ollama-fork:0.40.12-embergate.<sha> .
 # Then services/ollama-kid builds FROM it via --build-arg OLLAMA_BASE=<that tag>.
 #
 # embergate-r5 (R5/S4, 2026-10-28): llama-server is ALSO rebuilt from this tree, because
 # llama/compat/002-embergate-layer-schedule.patch (<arch>.layer_schedule) changes libllama. The two
 # llama-server stages below are upstream's Dockerfile `llama-server-cpu` and `llama-server-cuda_v13`
 # stages (same presets, same CMake flags and arch lists, same gcc-toolset-13 on EL8 as the stock
-# payload, which reports "built with GNU 13.3.1"). One deviation: upstream's amd64 `base` is
+# payload). One deviation: upstream's amd64 `base` is
 # rocm/dev-almalinux-8 (tens of GB, ROCm unused here); this uses plain almalinux:8 with the same
 # compiler, CMake and Ninja. Only the CPU payload (llama-server, libllama*, libggml*, libggml-cpu-*)
 # and cuda_v13 (the variant the seat loads) are rebuilt; the stock cuda_v12, vulkan and mlx payloads
-# are left as they are (ggml is untouched by our patch, same b11081 source).
-ARG OLLAMA_BASE=ollama/ollama:0.35.0
+# are left as they are (ggml is untouched by our patch, same llama.cpp source as LLAMA_CPP_VERSION).
+#
+# embergate-r5-040 (2026-10-28): rebased on upstream v0.40.12 (LLAMA_CPP_VERSION b11901, which has
+# llama.cpp's chunked GatedDeltaNet CUDA kernel, #29353). 002 re-made against b11901. The CPU stage
+# also copies libgomp/libomp into the payload, as upstream 0.40's does.
+ARG OLLAMA_BASE=ollama/ollama:0.40.12
 ARG CMAKEVERSION=3.31.2
 ARG NINJAVERSION=1.12.1
 
@@ -26,7 +30,7 @@ RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-
 ENV PATH=/usr/local/go/bin:$PATH
 RUN go mod download
 COPY . .
-ARG EMBERGATE_VERSION=0.35.0-embergate
+ARG EMBERGATE_VERSION=0.40.12-embergate
 ENV CGO_ENABLED=1
 # The feed package proves itself before the server is built.
 RUN go test ./feed/
@@ -56,7 +60,14 @@ COPY cmake cmake
 RUN cmake -S llama/server --preset cpu \
     && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cpu/_deps/llama_cpp-src/src/llama-model.cpp \
     && cmake --build build/llama-server-cpu -- -l $(nproc) \
-    && cmake --install build/llama-server-cpu --component llama-server --strip
+    && cmake --install build/llama-server-cpu --component llama-server --strip \
+    && for lib in \
+        /usr/lib64/libgomp.so* \
+        /usr/lib64/libomp.so* \
+        /opt/rh/gcc-toolset-13/root/usr/lib64/libgomp.so* \
+        /opt/rh/gcc-toolset-13/root/usr/lib64/libomp.so*; do \
+            [ -e "$lib" ] && cp -a "$lib" dist/lib/ollama/ || true; \
+        done
 
 FROM llama-base AS llama-server-cuda_v13
 ARG CUDA13VERSION=13.0

@@ -17,3 +17,7 @@ a model without an MTP head fails to load, and the draft/accept counts only exis
 
 **How it's served:** EmberGate host compose `services/ollama-kid/` builds `FROM ${OLLAMA_BASE}`; build this branch's
 image and pass its tag as `OLLAMA_BASE`. Current service: `ollama-kid-mtp` (harbor backend `ollama-kid`).
+
+**Branch `embergate-r5-040`** (2026-10-28, local, not deployed): the same fork commits (draft counts, feed, R5 layer
+schedule) cherry-picked onto upstream **v0.40.12** (`f067033f`, `LLAMA_CPP_VERSION` b11901, which carries llama.cpp's
+chunked GatedDeltaNet CUDA kernel). `llama/compat/002-embergate-layer-schedule.patch` is re-made against b11901.
