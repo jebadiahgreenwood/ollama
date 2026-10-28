@@ -83,8 +83,10 @@ RUN cmake -S llama/server --preset llama_cuda_v13_linux \
     && cmake --install build/llama-server-cuda_v13 --component llama-server --strip
 
 FROM ${OLLAMA_BASE}
-# Drop the stock payloads we replace, so no stale stock file survives beside ours.
-RUN cd /usr/lib/ollama && rm -rf cuda_v13 llama-server llama-quantize libllama*.so* libggml*.so* libmtmd.so*
+# Drop the stock payloads we replace, so no stale stock file survives beside ours. 0.40's cuda_v13 also
+# holds libnvJitLink/libnvrtc/libnvfatbin that mlx_cuda_v13's cusolver/cusparse load, so only its
+# libggml-cuda.so is removed there (our COPY overwrites the cudart/cublas runtime libs it ships).
+RUN cd /usr/lib/ollama && rm -rf cuda_v13/libggml-cuda.so llama-server llama-quantize libllama*.so* libggml*.so* libmtmd.so*
 COPY --from=llama-server-cpu      dist/lib/ollama /usr/lib/ollama/
 COPY --from=llama-server-cuda_v13 dist/lib/ollama /usr/lib/ollama/
 COPY --from=build /bin/ollama /usr/bin/ollama
