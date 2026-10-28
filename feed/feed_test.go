@@ -47,7 +47,7 @@ func waitFor(t *testing.T, dir string, n int) []map[string]any {
 
 type fakeCtx struct{ m map[string]any }
 
-func (f fakeCtx) Get(k string) (any, bool) { v, ok := f.m[k]; return v, ok }
+func (f fakeCtx) Get(k any) (any, bool) { s, _ := k.(string); v, ok := f.m[s]; return v, ok }
 
 func TestNilFeedIsNoop(t *testing.T) {
 	var f *Feed

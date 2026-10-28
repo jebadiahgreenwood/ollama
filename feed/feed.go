@@ -48,9 +48,9 @@ const queueSize = 1 << 16
 
 // Feed is one writer; Default is built from the environment at init.
 type Feed struct {
-	dir     string
-	ch      chan []byte
-	dropped atomic.Int64
+	dir       string
+	ch        chan []byte
+	dropped   atomic.Int64
 	program   map[string]any
 	once      sync.Once
 	stampOnce sync.Once
@@ -294,9 +294,10 @@ func (t *Turn) Close() {
 	t.f.emit(ev)
 }
 
-// Getter is the slice of gin.Context the stream writer needs.
+// Getter is the slice of gin.Context the stream writer needs. gin v1.12 (Ollama v0.40) takes the key
+// as any (v1.10, in v0.35, took a string); ContextKey is still set and read as a string.
 type Getter interface {
-	Get(key string) (any, bool)
+	Get(key any) (any, bool)
 }
 
 // OutFrom tees raw to the turn parked on the context, if any. Zero cost when the feed is off.
