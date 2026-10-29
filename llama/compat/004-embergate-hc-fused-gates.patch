@@ -1,0 +1,169 @@
+From 7efa64a6e6b2fa61614c517f1fd2003b658e4936 Mon Sep 17 00:00:00 2001
+From: EmberGate <jebadiahgreenwood@gmail.com>
+Date: Thu, 29 Oct 2026 02:20:01 +0000
+Subject: [PATCH] qwen35 HC: optional fused read gates blk.N.hc_{mix,mlp}.w_av
+ = [W_a | W_v] (EmberGate W-188 step 1)
+
+Both read projections take the same input v, so a file may store them as one [n*n_embd, r + n] tensor; the read
+then does one matvec and one 1/n scale and splits the product by row ranges ([0, r) -> silu path, [r, r + n) ->
+write scale). Files with w_a + w_v load and run exactly as before. CPU: unfused file prev vs new engine and fused
+vs unfused logit files byte-identical (llama-perplexity KLD files, 126,150,660 B), greedy identical.
+---
+ src/llama-arch.cpp    |  4 ++++
+ src/llama-arch.h      |  2 ++
+ src/llama-model.h     |  3 +++
+ src/models/models.h   |  1 +
+ src/models/qwen35.cpp | 39 +++++++++++++++++++++++++++++++--------
+ 5 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index a982fe91..0d54efef 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -651,6 +651,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_HC_MLP_W_A,                         "blk.%d.hc_mlp.w_a" },
+     { LLM_TENSOR_HC_MLP_W_U,                         "blk.%d.hc_mlp.w_u" },
+     { LLM_TENSOR_HC_MLP_W_V,                         "blk.%d.hc_mlp.w_v" },
++    { LLM_TENSOR_HC_MIX_W_AV,                        "blk.%d.hc_mix.w_av" },
++    { LLM_TENSOR_HC_MLP_W_AV,                        "blk.%d.hc_mlp.w_av" },
+     { LLM_TENSOR_PLE_KEY,                                "blk.%d.ple_key" },
+     { LLM_TENSOR_PLE_VALUE,                              "blk.%d.ple_value" },
+     { LLM_TENSOR_PLE_NORM_KEY,                           "blk.%d.ple_norm_key" },
+@@ -935,6 +937,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HC_MLP_W_A,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_MLP_W_U,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_MLP_W_V,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MIX_W_AV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_MLP_W_AV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_KEY,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_VALUE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_NORM_KEY,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index e968b396..8b22952a 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -694,6 +694,8 @@ enum llm_tensor {
+     LLM_TENSOR_HC_MLP_W_A,
+     LLM_TENSOR_HC_MLP_W_U,
+     LLM_TENSOR_HC_MLP_W_V,
++    LLM_TENSOR_HC_MIX_W_AV,         // W-188: [W_a | W_v] in one weight (same input v)
++    LLM_TENSOR_HC_MLP_W_AV,
+     LLM_TENSOR_PLE_KEY,        // qwen4exp
+     LLM_TENSOR_PLE_VALUE,      // qwen4exp
+     LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 650182de..dd947184 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -638,6 +638,9 @@ struct llama_layer {
+     struct ggml_tensor * hc_mlp_w_a  = nullptr;
+     struct ggml_tensor * hc_mlp_w_u  = nullptr;
+     struct ggml_tensor * hc_mlp_w_v  = nullptr;
++    // W-188: optional fused form, [n*n_embd, r + n] = W_a rows then W_v rows (replaces w_a + w_v when present)
++    struct ggml_tensor * hc_mix_w_av = nullptr;
++    struct ggml_tensor * hc_mlp_w_av = nullptr;
+ 
+     struct ggml_tensor * ple_key        = nullptr;
+     struct ggml_tensor * ple_value      = nullptr;
+diff --git a/src/models/models.h b/src/models/models.h
+index 5b0ed3a6..c8d20d70 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2623,6 +2623,7 @@ struct llama_model_qwen35 : public llama_model_base {
+                     ggml_tensor *  w_a,
+                     ggml_tensor *  w_u,
+                     ggml_tensor *  w_v,
++                    ggml_tensor *  w_av,
+                     ggml_tensor ** s,
+                             int    il);
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index be8758f7..abfabcb4 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -111,13 +111,20 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+             const int64_t nd = nb * n_embd;
+             const int64_t r  = hparams.residual_rank;
+             layer.hc_mix_gain = create_tensor(tn(LLM_TENSOR_HC_MIX_GAIN, il), { n_embd, nb }, flags);
+-            layer.hc_mix_w_a  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_A,  il), { nd, r },      flags);
+             layer.hc_mix_w_u  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_U,  il), { r, nd },      flags);
+-            layer.hc_mix_w_v  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_V,  il), { nd, nb },     flags);
+             layer.hc_mlp_gain = create_tensor(tn(LLM_TENSOR_HC_MLP_GAIN, il), { n_embd, nb }, flags);
+-            layer.hc_mlp_w_a  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_A,  il), { nd, r },      flags);
+             layer.hc_mlp_w_u  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_U,  il), { r, nd },      flags);
+-            layer.hc_mlp_w_v  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_V,  il), { nd, nb },     flags);
++            // W-188: a file carries either the fused w_av ([W_a | W_v], one matvec per read) or w_a + w_v
++            const bool fused = ml.get_tensor_meta(tn(LLM_TENSOR_HC_MIX_W_AV, il).str().c_str()) != nullptr;
++            if (fused) {
++                layer.hc_mix_w_av = create_tensor(tn(LLM_TENSOR_HC_MIX_W_AV, il), { nd, r + nb }, flags);
++                layer.hc_mlp_w_av = create_tensor(tn(LLM_TENSOR_HC_MLP_W_AV, il), { nd, r + nb }, flags);
++            } else {
++                layer.hc_mix_w_a  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_A,  il), { nd, r },      flags);
++                layer.hc_mix_w_v  = create_tensor(tn(LLM_TENSOR_HC_MIX_W_V,  il), { nd, nb },     flags);
++                layer.hc_mlp_w_a  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_A,  il), { nd, r },      flags);
++                layer.hc_mlp_w_v  = create_tensor(tn(LLM_TENSOR_HC_MLP_W_V,  il), { nd, nb },     flags);
++            }
+         }
+     };
+ 
+@@ -303,6 +310,7 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_read(
+         ggml_tensor *  w_a,
+         ggml_tensor *  w_u,
+         ggml_tensor *  w_v,
++        ggml_tensor *  w_av,
+         ggml_tensor ** s,
+         int            il) {
+     const int64_t nb = S->ne[1];
+@@ -313,14 +321,29 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_read(
+ 
+     ggml_tensor * v = ggml_reshape_2d(ctx0, rh, n_embd*nb, nt);
+ 
+-    ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_a, v), 1.0f / (float) nb));
++    // W-188: with the fused w_av one matvec + one 1/n scale give both W_a v / n (rows [0, r)) and W_v v / n (rows
++    // [r, r + n)); the two row views feed silu / sigmoid directly (both ops take row-strided input)
++    ggml_tensor * av = nullptr;
++    ggml_tensor * pa = nullptr;
++    ggml_tensor * pv = nullptr;
++    if (w_av) {
++        const int64_t r = w_av->ne[1] - nb;
++        av = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_av, v), 1.0f / (float) nb);
++        pa = ggml_view_2d(ctx0, av, r,  nt, av->nb[1], 0);
++        pv = ggml_view_2d(ctx0, av, nb, nt, av->nb[1], r*ggml_element_size(av));
++    } else {
++        pa = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_a, v), 1.0f / (float) nb);
++        pv = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_v, v), 1.0f / (float) nb);
++    }
++
++    ggml_tensor * lo = ggml_silu(ctx0, pa);
+     ggml_tensor * g  = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, w_u, lo)), 2.0f);
+     cb(g, "hc_gate", il);
+ 
+     ggml_tensor * x = hc_branch_mean(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, g, n_embd, nb, nt), rh));
+     cb(x, "hc_read", il);
+ 
+-    *s = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_v, v), 1.0f / (float) nb)), 2.0f);
++    *s = ggml_scale(ctx0, ggml_sigmoid(ctx0, pv), 2.0f);
+     cb(*s, "hc_write_scale", il);
+ 
+     return x;
+@@ -362,7 +385,7 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_trunk(
+         }
+ 
+         ggml_tensor * s   = nullptr;
+-        ggml_tensor * cur = build_hc_read(S, layer.hc_mix_gain, layer.hc_mix_w_a, layer.hc_mix_w_u, layer.hc_mix_w_v, &s, il);
++        ggml_tensor * cur = build_hc_read(S, layer.hc_mix_gain, layer.hc_mix_w_a, layer.hc_mix_w_u, layer.hc_mix_w_v, layer.hc_mix_w_av, &s, il);
+         ggml_build_forward_expand(gf, cur);
+ 
+         if (hparams.is_recr(il)) {
+@@ -382,7 +405,7 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_trunk(
+         S = build_hc_write(S, s, cur, il);
+         cb(S, "attn_residual", il);
+ 
+-        cur = build_hc_read(S, layer.hc_mlp_gain, layer.hc_mlp_w_a, layer.hc_mlp_w_u, layer.hc_mlp_w_v, &s, il);
++        cur = build_hc_read(S, layer.hc_mlp_gain, layer.hc_mlp_w_a, layer.hc_mlp_w_u, layer.hc_mlp_w_v, layer.hc_mlp_w_av, &s, il);
+         cur = build_layer_ffn(cur, il);
+ 
+         S = build_hc_write(S, s, cur, il);
+-- 
+2.43.0
+
