@@ -65,6 +65,7 @@ RUN cmake -S llama/server --preset cpu \
     && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cpu/_deps/llama_cpp-src/src/llama-model.cpp \
     && grep -q LLM_KV_RESIDUAL_STREAMS build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && grep -q LLM_TENSOR_HC_MIX_W_AV build/llama-server-cpu/_deps/llama_cpp-src/src/llama-arch.h \
+    && grep -q ggml_dsv4_hc_pre_gated build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && cmake --build build/llama-server-cpu -- -l $(nproc) \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && for lib in \
@@ -87,6 +88,7 @@ RUN cmake -S llama/server --preset llama_cuda_v13_linux \
     && grep -q LLM_KV_LAYER_SCHEDULE build/llama-server-cuda_v13/_deps/llama_cpp-src/src/llama-model.cpp \
     && grep -q LLM_KV_RESIDUAL_STREAMS build/llama-server-cuda_v13/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && grep -q LLM_TENSOR_HC_MIX_W_AV build/llama-server-cuda_v13/_deps/llama_cpp-src/src/llama-arch.h \
+    && grep -q ggml_dsv4_hc_pre_gated build/llama-server-cuda_v13/_deps/llama_cpp-src/src/models/qwen35.cpp \
     && cmake --build build/llama-server-cuda_v13 -- -l $(nproc) \
     && cmake --install build/llama-server-cuda_v13 --component llama-server --strip
 

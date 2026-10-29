@@ -1,0 +1,113 @@
+From bc0e27a622d044a003175500b09b5d5f6f69a4c8 Mon Sep 17 00:00:00 2001
+From: EmberGate <jebadiahgreenwood@gmail.com>
+Date: Thu, 29 Oct 2026 18:05:16 +0000
+Subject: [PATCH] qwen35 HC: fused-ops read/write when w_av is present
+ (EmberGate W-188 step 3)
+
+With the fused w_av gates the read gated branch mean is one ggml_dsv4_hc_pre_gated (scale 2/n, sigmoid inside) and
+the write is one ggml_dsv4_hc_post, preceded by SCALE(1) -> SIGMOID -> SCALE(2) so the CUDA backend fuses the
+write-scale chain into the post kernel. The W_v rows are made contiguous only when T > 1 (CPU scale needs it).
+Files with w_a + w_v run the original R5/S2 graph unchanged (CPU logit files byte-identical to 18306d36). CPU:
+fused-ops F32 vs the old graph mean KLD 4.4e-5 (last-bit order: pairwise vs sequential branch sum, FMA in post);
+vs HF fp32 max KL 1.1e-3, top-1 108/108, greedy 128/128 (old graph 8.3e-4, 108/108, 128/128).
+---
+ src/models/models.h   |  1 +
+ src/models/qwen35.cpp | 43 +++++++++++++++++++++++++++++++------------
+ 2 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/src/models/models.h b/src/models/models.h
+index c8d20d70..e767491a 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2631,6 +2631,7 @@ struct llama_model_qwen35 : public llama_model_base {
+                     ggml_tensor * S,
+                     ggml_tensor * s,
+                     ggml_tensor * y,
++                            bool  raw_s,
+                             int   il);
+ 
+         const llama_model & model;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index abfabcb4..16594b23 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -321,20 +321,27 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_read(
+ 
+     ggml_tensor * v = ggml_reshape_2d(ctx0, rh, n_embd*nb, nt);
+ 
+-    // W-188: with the fused w_av one matvec + one 1/n scale give both W_a v / n (rows [0, r)) and W_v v / n (rows
+-    // [r, r + n)); the two row views feed silu / sigmoid directly (both ops take row-strided input)
+-    ggml_tensor * av = nullptr;
++    // W-188: a file with the fused w_av ([W_a | W_v]) does both projections in one matvec and splits the product by
++    // row ranges ([0, r) -> silu path, [r, r + n) -> write scale); the row views are strided, which every consumer takes
+     ggml_tensor * pa = nullptr;
+     ggml_tensor * pv = nullptr;
+     if (w_av) {
+-        const int64_t r = w_av->ne[1] - nb;
+-        av = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_av, v), 1.0f / (float) nb);
+-        pa = ggml_view_2d(ctx0, av, r,  nt, av->nb[1], 0);
+-        pv = ggml_view_2d(ctx0, av, nb, nt, av->nb[1], r*ggml_element_size(av));
+-    } else {
+-        pa = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_a, v), 1.0f / (float) nb);
+-        pv = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_v, v), 1.0f / (float) nb);
++        // W-188 step 3: the fused-ops path. x = (2/n) sum_h Rh_h * sigmoid(W_u silu(W_a v / n))_h in one
++        // ggml_dsv4_hc_pre_gated; *s is returned as the W_v v / n row view (pre-sigmoid) and build_hc_write turns it
++        // into 2*sigmoid(.) right before ggml_dsv4_hc_post, the chain CUDA fuses into the post kernel
++        const int64_t r  = w_av->ne[1] - nb;
++        ggml_tensor * mm = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_av, v), 1.0f / (float) nb);
++        ggml_tensor * lo = ggml_silu(ctx0, ggml_view_2d(ctx0, mm, r, nt, mm->nb[1], 0));
++        ggml_tensor * gt = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, w_u, lo), n_embd, nb, nt);
++        cb(gt, "hc_gate", il);
++        ggml_tensor * x  = ggml_dsv4_hc_pre_gated(ctx0, rh, gt, 2.0f / (float) nb);
++        cb(x, "hc_read", il);
++        *s = ggml_view_2d(ctx0, mm, nb, nt, mm->nb[1], r*ggml_element_size(mm));
++        return x;
+     }
++    // the separate-gates file (w_a + w_v): the original R5/S2 graph, unchanged
++    pa = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_a, v), 1.0f / (float) nb);
++    pv = ggml_scale(ctx0, ggml_mul_mat(ctx0, w_v, v), 1.0f / (float) nb);
+ 
+     ggml_tensor * lo = ggml_silu(ctx0, pa);
+     ggml_tensor * g  = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, w_u, lo)), 2.0f);
+@@ -353,10 +360,22 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_write(
+         ggml_tensor * S,
+         ggml_tensor * s,
+         ggml_tensor * y,
++        bool          raw_s,
+         int           il) {
+     const int64_t nb = S->ne[1];
+     const int64_t nt = S->ne[2];
+ 
++    if (raw_s) {
++        // W-188 step 3: s arrives as W_v v / n (pre-sigmoid, a row view: contiguous only when T == 1, and CPU scale
++        // needs contiguous). SCALE(1) -> SIGMOID -> SCALE(2) -> HC_POST back to back is the pattern CUDA fuses into
++        // one kernel (the leading SCALE(1) is there to match it): S_i += y * 2*sigmoid(W_v v / n)_i
++        ggml_tensor * p    = ggml_is_contiguous(s) ? s : ggml_cont(ctx0, s);
++        ggml_tensor * post = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, p, 1.0f)), 2.0f);
++        ggml_tensor * out  = ggml_dsv4_hc_post(ctx0, y, S, post, nullptr);
++        cb(out, "hc_write", il);
++        return out;
++    }
++
+     ggml_tensor * yb  = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, y, n_embd, 1, nt), n_embd, nb, nt, 1);
+     ggml_tensor * out = ggml_add(ctx0, S, ggml_mul(ctx0, yb, ggml_reshape_3d(ctx0, s, 1, nb, nt)));
+     cb(out, "hc_write", il);
+@@ -402,13 +421,13 @@ ggml_tensor * llama_model_qwen35::graph::build_hc_trunk(
+             S   = ggml_reshape_3d(ctx0, S, n_embd, nb, S->ne[1]);
+         }
+ 
+-        S = build_hc_write(S, s, cur, il);
++        S = build_hc_write(S, s, cur, layer.hc_mix_w_av != nullptr, il);
+         cb(S, "attn_residual", il);
+ 
+         cur = build_hc_read(S, layer.hc_mlp_gain, layer.hc_mlp_w_a, layer.hc_mlp_w_u, layer.hc_mlp_w_v, layer.hc_mlp_w_av, &s, il);
+         cur = build_layer_ffn(cur, il);
+ 
+-        S = build_hc_write(S, s, cur, il);
++        S = build_hc_write(S, s, cur, layer.hc_mlp_w_av != nullptr, il);
+         S = build_cvec(S, il);  // a control vector [n_embd] broadcasts over the branches (moves their mean)
+         cb(S, "hc_l_out", il);
+     }
+-- 
+2.43.0
+
