@@ -1,0 +1,356 @@
+From 848a4cadce8dcc5e931bc576babffbef5ccdac61 Mon Sep 17 00:00:00 2001
+From: EmberGate <embergate@local>
+Date: Tue, 10 Nov 2026 13:36:16 +0000
+Subject: [PATCH] qwen35 HC: optional per-pass read gates
+ (<arch>.residual_gate_map + pass.k.hc_*) (EmberGate T-052)
+
+A uint32 array <arch>.residual_gate_map, one entry per <arch>.layer_schedule position, names the gate set each
+position reads: g < n file trunk layers = blk.g.hc_* (what every position reads without the key), g >= n = the extra
+set pass.(g - n).hc_{mix,mlp}.{gain,w_a,w_u,w_v} (or gain + w_u + w_av, the fused W-188 form). The sets are created
+in the buffer of the file layer whose position reads them first; the schedule expansion points each position's hc_*
+at its set, so the graph (build_hc_read / fused ops) is unchanged.
+
+No key: identical behaviour (CPU logit files byte-identical on the seated HC files). Refusals name the position and
+tensor: map length != schedule, map without schedule or without residual_streams, a set no position reads, a
+missing pass tensor, pass.* tensors without the map. An engine without this patch refuses a file with pass.*
+tensors ("wrong number of tensors").
+---
+ src/llama-arch.cpp    | 21 ++++++++++
+ src/llama-arch.h      | 11 ++++++
+ src/llama-model.cpp   | 92 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-model.h     | 11 ++++++
+ src/models/models.h   |  1 +
+ src/models/qwen35.cpp | 77 ++++++++++++++++++++++++++++++++++++
+ 6 files changed, 213 insertions(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 0d54efef..773d7836 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -240,6 +240,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_LAYER_SCHEDULE,                    "%s.layer_schedule"                    },
+     { LLM_KV_RESIDUAL_STREAMS,                  "%s.residual_streams"                  },
+     { LLM_KV_RESIDUAL_RANK,                     "%s.residual_rank"                     },
++    { LLM_KV_RESIDUAL_GATE_MAP,                 "%s.residual_gate_map"                 },
+     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
+     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
+     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
+@@ -653,6 +654,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_HC_MLP_W_V,                         "blk.%d.hc_mlp.w_v" },
+     { LLM_TENSOR_HC_MIX_W_AV,                        "blk.%d.hc_mix.w_av" },
+     { LLM_TENSOR_HC_MLP_W_AV,                        "blk.%d.hc_mlp.w_av" },
++    { LLM_TENSOR_HC_PASS_MIX_GAIN,                     "pass.%d.hc_mix.gain" },
++    { LLM_TENSOR_HC_PASS_MIX_W_A,                      "pass.%d.hc_mix.w_a" },
++    { LLM_TENSOR_HC_PASS_MIX_W_U,                      "pass.%d.hc_mix.w_u" },
++    { LLM_TENSOR_HC_PASS_MIX_W_V,                      "pass.%d.hc_mix.w_v" },
++    { LLM_TENSOR_HC_PASS_MLP_GAIN,                     "pass.%d.hc_mlp.gain" },
++    { LLM_TENSOR_HC_PASS_MLP_W_A,                      "pass.%d.hc_mlp.w_a" },
++    { LLM_TENSOR_HC_PASS_MLP_W_U,                      "pass.%d.hc_mlp.w_u" },
++    { LLM_TENSOR_HC_PASS_MLP_W_V,                      "pass.%d.hc_mlp.w_v" },
++    { LLM_TENSOR_HC_PASS_MIX_W_AV,                     "pass.%d.hc_mix.w_av" },
++    { LLM_TENSOR_HC_PASS_MLP_W_AV,                     "pass.%d.hc_mlp.w_av" },
+     { LLM_TENSOR_PLE_KEY,                                "blk.%d.ple_key" },
+     { LLM_TENSOR_PLE_VALUE,                              "blk.%d.ple_value" },
+     { LLM_TENSOR_PLE_NORM_KEY,                           "blk.%d.ple_norm_key" },
+@@ -939,6 +950,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HC_MLP_W_V,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_MIX_W_AV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_MLP_W_AV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MIX_GAIN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_HC_PASS_MIX_W_A,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MIX_W_U,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MIX_W_V,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MLP_GAIN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_HC_PASS_MLP_W_A,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MLP_W_U,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MLP_W_V,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MIX_W_AV,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_HC_PASS_MLP_W_AV,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_KEY,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_VALUE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_PLE_NORM_KEY,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 8b22952a..6877b8a1 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -244,6 +244,7 @@ enum llm_kv {
+     LLM_KV_LAYER_SCHEDULE,
+     LLM_KV_RESIDUAL_STREAMS, // EmberGate R5/S2: qwen35 n-branch gated residual
+     LLM_KV_RESIDUAL_RANK,
++    LLM_KV_RESIDUAL_GATE_MAP, // EmberGate T-052: per schedule position, the gate set it reads
+     LLM_KV_NUM_DEEPSTACK_LAYERS,
+     LLM_KV_DEEPSTACK_MAPPING,
+     LLM_KV_HIDDEN_ACT,
+@@ -696,6 +697,16 @@ enum llm_tensor {
+     LLM_TENSOR_HC_MLP_W_V,
+     LLM_TENSOR_HC_MIX_W_AV,         // W-188: [W_a | W_v] in one weight (same input v)
+     LLM_TENSOR_HC_MLP_W_AV,
++    LLM_TENSOR_HC_PASS_MIX_GAIN,    // EmberGate T-052: pass.k.hc_* = an extra gate set (residual_gate_map)
++    LLM_TENSOR_HC_PASS_MIX_W_A,
++    LLM_TENSOR_HC_PASS_MIX_W_U,
++    LLM_TENSOR_HC_PASS_MIX_W_V,
++    LLM_TENSOR_HC_PASS_MLP_GAIN,
++    LLM_TENSOR_HC_PASS_MLP_W_A,
++    LLM_TENSOR_HC_PASS_MLP_W_U,
++    LLM_TENSOR_HC_PASS_MLP_W_V,
++    LLM_TENSOR_HC_PASS_MIX_W_AV,
++    LLM_TENSOR_HC_PASS_MLP_W_AV,
+     LLM_TENSOR_PLE_KEY,        // qwen4exp
+     LLM_TENSOR_PLE_VALUE,      // qwen4exp
+     LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6c61e70d..a3e3eded 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1294,6 +1294,8 @@ struct llama_model::impl {
+     // EmberGate layer schedule (empty = none): position -> file trunk layer
+     std::vector<uint32_t> layer_schedule;
+     llama_hparams         hparams_file; // hparams as the file declares them (valid when layer_schedule is set)
++    // EmberGate T-052 (empty = none): position -> gate set (< n file trunk layers: blk.g.hc_*, else pass.(g - n).hc_*)
++    std::vector<uint32_t> residual_gate_map;
+ 
+     bool has_tensor_overrides;
+ 
+@@ -1573,6 +1575,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     load_arch_hparams(ml);
+ 
+     apply_layer_schedule(ml);
++    apply_residual_gate_map(ml);
+ 
+     pimpl->n_bytes = ml.n_bytes;
+ 
+@@ -1694,6 +1697,72 @@ void llama_model_base::apply_layer_schedule(llama_model_loader & ml) {
+         __func__, key.c_str(), n_pos, n_file, s.c_str(), n_next);
+ }
+ 
++// EmberGate T-052: optional <arch>.residual_gate_map = array of gate-set indices, one per trunk POSITION of
++// <arch>.layer_schedule. g < n (n = file trunk layers) reads file layer g's blk.g.hc_* gates (without the key every
++// position reads its own file layer's: today's behaviour); g >= n reads the extra set pass.(g - n).hc_*, so a
++// repeated pass can carry its own trained read gates (archmods B{b}.T{j}). Absent key: nothing changes.
++void llama_model_base::apply_residual_gate_map(llama_model_loader & ml) {
++    std::vector<uint32_t> gmap;
++    if (!ml.get_arr(LLM_KV_RESIDUAL_GATE_MAP, gmap, false)) {
++        return;
++    }
++    const std::string key  = LLM_KV(arch)(LLM_KV_RESIDUAL_GATE_MAP);
++    const std::string skey = LLM_KV(arch)(LLM_KV_LAYER_SCHEDULE);
++    if (hparams.n_residual_streams <= 1) {
++        throw std::runtime_error(format("%s is present but %s is %u: a gate map needs the n-branch residual "
++            "(blk.N.hc_* gates); remove the key or add the gates", key.c_str(),
++            LLM_KV(arch)(LLM_KV_RESIDUAL_STREAMS).c_str(), hparams.n_residual_streams));
++    }
++    if (pimpl->layer_schedule.empty()) {
++        throw std::runtime_error(format("%s is present but %s is not: the map has one entry per schedule position, "
++            "and without a schedule every layer runs once with its own gates; remove the key", key.c_str(), skey.c_str()));
++    }
++    const auto & sched = pimpl->layer_schedule;
++    const uint32_t n_file = pimpl->hparams_file.n_layer();
++    if (gmap.size() != sched.size()) {
++        throw std::runtime_error(format("%s has %zu entries but %s has %zu positions: one gate set per position",
++            key.c_str(), gmap.size(), skey.c_str(), sched.size()));
++    }
++    uint32_t n_sets = 0;
++    for (const uint32_t g : gmap) {
++        if (g >= n_file) { n_sets = std::max(n_sets, g - n_file + 1); }
++    }
++    if (n_sets > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error(format("%s names pass set %u; at most %d pass sets are supported",
++            key.c_str(), n_sets - 1, LLAMA_MAX_LAYERS));
++    }
++    for (uint32_t k = 0; k < n_sets; ++k) {
++        if (std::find(gmap.begin(), gmap.end(), n_file + k) == gmap.end()) {
++            throw std::runtime_error(format("%s names pass sets up to pass.%u, but no position reads pass.%u "
++                "(value %u): its tensors would be unused; renumber the sets 0..%u in order of use",
++                key.c_str(), n_sets - 1, k, n_file + k, n_sets - 2));
++        }
++    }
++    pimpl->residual_gate_map = gmap;
++
++    std::string s;
++    uint32_t n_own = 0, n_other = 0;
++    for (uint32_t p = 0; p < gmap.size(); ++p) {
++        const uint32_t g = gmap[p];
++        if (g == sched[p]) { ++n_own; continue; }
++        ++n_other;
++        if (s.size() < 400) {
++            s += format("%s%u:%s", s.empty() ? "" : " ", p,
++                g >= n_file ? format("pass.%u", g - n_file).c_str() : format("blk.%u", g).c_str());
++        }
++    }
++    LLAMA_LOG_INFO("%s: %s: %u positions read their own layer's gates, %u read another set (%u pass sets) [%s%s]\n",
++        __func__, key.c_str(), n_own, n_other, n_sets, s.c_str(), s.size() >= 400 ? " ..." : "");
++}
++
++const std::vector<uint32_t> & llama_model_base::layer_schedule_positions() const {
++    return pimpl->layer_schedule;
++}
++
++const std::vector<uint32_t> & llama_model_base::residual_gate_map() const {
++    return pimpl->residual_gate_map;
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+@@ -1999,6 +2068,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             const uint32_t f = p < n_pos ? pimpl->layer_schedule[p] : n_file + (p - n_pos);
+             layers_pos[p] = layers.at(f);         // same ggml tensors: weights shared
+             dev_pos[p]    = pimpl->dev_layer.at(f); // caches live with their layer's weights
++            // T-052: a position whose gate-map entry names another set reads that set's hc_* gates
++            const uint32_t g = (p < n_pos && !pimpl->residual_gate_map.empty()) ? pimpl->residual_gate_map[p] : f;
++            if (g != f) {
++                const llama_layer & gs = g < n_file ? layers.at(g) : hc_pass_sets.at(g - n_file);
++                auto & L = layers_pos[p];
++                L.hc_mix_gain = gs.hc_mix_gain; L.hc_mix_w_a = gs.hc_mix_w_a; L.hc_mix_w_u = gs.hc_mix_w_u;
++                L.hc_mix_w_v  = gs.hc_mix_w_v;  L.hc_mix_w_av = gs.hc_mix_w_av;
++                L.hc_mlp_gain = gs.hc_mlp_gain; L.hc_mlp_w_a = gs.hc_mlp_w_a; L.hc_mlp_w_u = gs.hc_mlp_w_u;
++                L.hc_mlp_w_v  = gs.hc_mlp_w_v;  L.hc_mlp_w_av = gs.hc_mlp_w_av;
++                if (L.hc_mix_gain == nullptr || L.hc_mlp_gain == nullptr) {
++                    throw std::runtime_error(format("%s[%u] = %u: that gate set was not loaded (the arch loader "
++                        "creates pass.k.hc_* only for qwen35 with residual_streams > 1)",
++                        LLM_KV(arch)(LLM_KV_RESIDUAL_GATE_MAP).c_str(), p, g));
++                }
++            }
+         }
+         layers           = std::move(layers_pos);
+         pimpl->dev_layer = std::move(dev_pos);
+@@ -3987,6 +4071,14 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
+     return create_tensor(*ml, tn, ne, flags);
+ }
+ 
++ggml_tensor * llama_model_base::create_tensor_on_layer(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags, int il_dev) {
++    GGML_ASSERT(ml != nullptr);
++    GGML_ASSERT(il_dev >= 0 && (size_t) il_dev < pimpl->dev_layer.size());
++    return ml->create_tensor(
++        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
++        pimpl->dev_layer.at(il_dev).buft_list, tn, ne, flags);
++}
++
+ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+     if (flags & TENSOR_SKIP) {
+         const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index dd947184..82c0e0a5 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -951,6 +951,17 @@ struct llama_model_base : public llama_model {
+     // EmberGate: <arch>.layer_schedule (see llama-model.cpp)
+     void apply_layer_schedule(llama_model_loader & ml);
+ 
++    // EmberGate T-052: optional <arch>.residual_gate_map (see llama-model.cpp). The arch loader reads the map and the
++    // schedule (file layer per position) while the tensors are created, and fills hc_pass_sets with the pass.k.hc_*
++    // gate sets; the schedule expansion then points each position's hc_* at the set its map entry names.
++    void apply_residual_gate_map(llama_model_loader & ml);
++    const std::vector<uint32_t> & layer_schedule_positions() const; // empty = no <arch>.layer_schedule
++    const std::vector<uint32_t> & residual_gate_map() const;        // empty = no <arch>.residual_gate_map
++    std::vector<llama_layer> hc_pass_sets;                           // set k = map value - n file trunk layers
++
++    // create a tensor in the buffer of file layer il_dev (for tensors that are not named after a layer)
++    ggml_tensor * create_tensor_on_layer(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags, int il_dev);
++
+     friend struct llama_model;
+ 
+     llama_model * model;
+diff --git a/src/models/models.h b/src/models/models.h
+index e767491a..b37d8e40 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2578,6 +2578,7 @@ struct llama_model_qwen35 : public llama_model_base {
+     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
++    void load_hc_pass_sets(llama_model_loader & ml, int flags); // EmberGate T-052: pass.k.hc_* (residual_gate_map)
+ 
+     struct graph : public llm_build_delta_net_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 16594b23..2eb79dfd 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -159,6 +159,83 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+     for (int i = n_layer; i < n_layer_all; ++i) {
+         load_block_mtp(i);
+     }
++    load_hc_pass_sets(ml, trunk_flags);
++}
++
++// EmberGate T-052: the extra gate sets of <arch>.residual_gate_map (pass.k.hc_mix.* / pass.k.hc_mlp.*), same shapes and
++// forms as blk.N.hc_* (w_a + w_v, or the fused w_av of W-188). Each set goes in the buffer of the file layer whose
++// position reads it first. A file with pass.* tensors but no map is refused here, naming a tensor.
++void llama_model_qwen35::load_hc_pass_sets(llama_model_loader & ml, int flags) {
++    const auto & gmap  = residual_gate_map();
++    const std::string key = ml.llm_kv(LLM_KV_RESIDUAL_GATE_MAP);
++    const uint32_t n_file = hparams.n_layer(); // the file's hparams here (load_tensors swaps them in)
++    uint32_t n_sets = 0;
++    for (const uint32_t g : gmap) {
++        if (g >= n_file) { n_sets = std::max(n_sets, g - n_file + 1); }
++    }
++    for (const auto & [name, w] : ml.weights_map) {
++        if (name.rfind("pass.", 0) != 0) {
++            continue;
++        }
++        const uint32_t k = (uint32_t) std::strtoul(name.c_str() + 5, nullptr, 10);
++        if (gmap.empty()) {
++            throw std::runtime_error(format("the file has per-pass gate tensor '%s' but no %s: nothing would read it; "
++                "repack with add_residual_gates.py --per-pass on (writes the map) or --per-pass off (shared gates only)",
++                name.c_str(), key.c_str()));
++        }
++        if (k >= n_sets) {
++            throw std::runtime_error(format("the file has '%s' (pass set %u), but %s names %u pass set(s) "
++                "(values %u..%u): nothing would read it", name.c_str(), k, key.c_str(), n_sets, n_file,
++                n_file + (n_sets ? n_sets : 1) - 1));
++        }
++    }
++    hc_pass_sets.assign(n_sets, llama_layer{});
++    if (n_sets == 0) {
++        return;
++    }
++    const auto & sched = layer_schedule_positions();
++    const int64_t n_embd = hparams.n_embd;
++    const int64_t nb = hparams.n_residual_streams;
++    const int64_t nd = nb * n_embd;
++    const int64_t r  = hparams.residual_rank;
++    for (uint32_t k = 0; k < n_sets; ++k) {
++        const uint32_t p = (uint32_t) (std::find(gmap.begin(), gmap.end(), n_file + k) - gmap.begin());
++        const int f = (int) sched.at(p);
++        const bool fused = ml.get_tensor_meta(tn(LLM_TENSOR_HC_PASS_MIX_W_AV, k).str().c_str()) != nullptr;
++        std::vector<llm_tensor> need = { LLM_TENSOR_HC_PASS_MIX_GAIN, LLM_TENSOR_HC_PASS_MIX_W_U,
++                                         LLM_TENSOR_HC_PASS_MLP_GAIN, LLM_TENSOR_HC_PASS_MLP_W_U };
++        if (fused) {
++            need.insert(need.end(), { LLM_TENSOR_HC_PASS_MIX_W_AV, LLM_TENSOR_HC_PASS_MLP_W_AV });
++        } else {
++            need.insert(need.end(), { LLM_TENSOR_HC_PASS_MIX_W_A, LLM_TENSOR_HC_PASS_MIX_W_V,
++                                      LLM_TENSOR_HC_PASS_MLP_W_A, LLM_TENSOR_HC_PASS_MLP_W_V });
++        }
++        for (const llm_tensor t : need) {
++            const std::string nm = tn(t, k).str();
++            if (ml.get_tensor_meta(nm.c_str()) == nullptr) {
++                throw std::runtime_error(format("%s[%u] = %u reads pass set %u (first reader; file layer %d), but the "
++                    "file has no '%s'. A %s pass set is gain + w_u + %s for both hc_mix and hc_mlp",
++                    key.c_str(), p, n_file + k, k, f, nm.c_str(), fused ? "fused" : "plain",
++                    fused ? "w_av" : "w_a + w_v"));
++            }
++        }
++        auto & S = hc_pass_sets[k];
++        S.hc_mix_gain = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MIX_GAIN, k), { n_embd, nb }, flags, f);
++        S.hc_mix_w_u  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MIX_W_U,  k), { r, nd },      flags, f);
++        S.hc_mlp_gain = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MLP_GAIN, k), { n_embd, nb }, flags, f);
++        S.hc_mlp_w_u  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MLP_W_U,  k), { r, nd },      flags, f);
++        if (fused) {
++            S.hc_mix_w_av = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MIX_W_AV, k), { nd, r + nb }, flags, f);
++            S.hc_mlp_w_av = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MLP_W_AV, k), { nd, r + nb }, flags, f);
++        } else {
++            S.hc_mix_w_a  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MIX_W_A,  k), { nd, r },  flags, f);
++            S.hc_mix_w_v  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MIX_W_V,  k), { nd, nb }, flags, f);
++            S.hc_mlp_w_a  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MLP_W_A,  k), { nd, r },  flags, f);
++            S.hc_mlp_w_v  = create_tensor_on_layer(tn(LLM_TENSOR_HC_PASS_MLP_W_V,  k), { nd, nb }, flags, f);
++        }
++    }
++    LLAMA_LOG_INFO("%s: %s: %u pass gate set(s) loaded (%s)\n", __func__, key.c_str(), n_sets,
++        ml.get_tensor_meta(tn(LLM_TENSOR_HC_PASS_MIX_W_AV, 0).str().c_str()) ? "fused w_av" : "w_a + w_v");
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
+-- 
+2.43.0
+

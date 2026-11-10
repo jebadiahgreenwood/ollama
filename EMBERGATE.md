@@ -26,3 +26,11 @@ chunked GatedDeltaNet CUDA kernel). `llama/compat/002-embergate-layer-schedule.p
 `llama/compat/003-embergate-residual-streams.patch`, the optional n-branch gated residual for qwen35
 (`<arch>.residual_streams` + `<arch>.residual_rank`, per-layer F32 `blk.N.hc_{mix,mlp}.{gain,w_a,w_u,w_v}`;
 llama.cpp branch `embergate-r5-hc` 18306d36). A GGUF without the key builds the plain graph exactly as before.
+
+**Branch `embergate-r5-040-hc-pp`** (2026-11-10, T-052, local, not deployed): `embergate-r5-040-hc-ops` plus
+`llama/compat/006-embergate-hc-per-pass-gates.patch`: optional per-pass read gates for a scheduled HC model. The uint32
+array `<arch>.residual_gate_map` (one entry per `<arch>.layer_schedule` position) names the gate set each position
+reads (g < n file trunk layers = `blk.g.hc_*`, g >= n = `pass.(g-n).hc_{mix,mlp}.*`, plain or fused w_av). No key =
+the hc-ops engine exactly (CPU logit files byte-identical on the seated HC files). Pack with the workspace's
+`research/arch-experiments/r5/add_residual_gates.py --per-pass on`. Rollback hazard: an engine without 006 refuses a
+file with `pass.*` tensors ("wrong number of tensors"), so roll such a model back with the engine.
